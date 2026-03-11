@@ -1,286 +1,285 @@
-from telethon import functions
+import logging
 import asyncio
+import random
+import json
+import os
 import re
-import requests
-from telethon import TelegramClient, events
-from telethon.errors import FloodWaitError
+import shutil
+import time
+from datetime import timedelta
+from typing import Dict, List, Optional
+from dotenv import load_dotenv
 
-# =========================
-API_ID = 37368606
-API_HASH = "b9b485bba1728c4a87b18d263c286e95"
+from aiogram import Bot, Dispatcher, types, F, Router
+from aiogram.filters import Command
+from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, FSInputFile
+from aiogram.enums import ParseMode, ChatAction
+from aiogram.client.default import DefaultBotProperties
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
 
-HH_API_URL = "https://max1mapp.online/api/chat/v2"
-HH_ADMIN_KEY = "luchshemu-truvun"
+from cerebras.cloud.sdk import Cerebras
+import instaloader
 
-CHANNEL_USERNAME = "Wewinfree"
-CHAT_USERNAME = "WeWinChat"
-# =========================
+class BotStorage:
+    @staticmethod
+    def load_json(file_path: str, default: dict) -> dict:
+        if os.path.exists(file_path):
+            try:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except:
+                return default
+        return default
 
-import requests
-import re
+    @staticmethod
+    def save_json(file_path: str, data: dict):
+        with open(file_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=4)
 
-async def search_internet(query):
-    try:
-        url = "https://lite.duckduckgo.com/lite/"
-        response = requests.post(url, data={"q": query}, timeout=5)
+class ConfigManager:
+    def __init__(self, path="config.json"):
+        self.path = path
+        self.data = BotStorage.load_json(path, {
+            "model": "zai-glm-4.7",
+            "prompt": "Ты — Джарвис, ироничный ассистент S010lvloon. Отвечай кратко и по-человечески.",
+            "rules": "Правила не установлены.",
+            "context_size": 10,
+            "notes": {"#news": "Вот свежие новости: [ссылка]"}
+        })
 
-        matches = re.findall(r'<a rel="nofollow" class="result-link".*?>(.*?)</a>', response.text)
+    def get(self, key): return self.data.get(key)
+    def set(self, key, value):
+        self.data[key] = value
+        BotStorage.save_json(self.path, self.data)
 
-        if matches:
-            clean = re.sub("<.*?>", "", matches[0])
-            return clean
+class HistoryManager:
+    def __init__(self, path="history.json"):
+        self.path = path
+        self.data = BotStorage.load_json(path, {})
 
-    except Exception as e:
-        print("❌ Ошибка поиска:", e)
+    def add_msg(self, key: str, role: str, content: str, limit: int):
+        if key not in self.data: self.data[key] = []
+        self.data[key].append({"role": role, "content": content})
+        self.data[key] = self.data[key][-limit:]
+        BotStorage.save_json(self.path, self.data)
 
-    return None
+    def get_history(self, key: str): return self.data.get(key, [])
 
-client = TelegramClient("session_bot", API_ID, API_HASH)
+class AIProcessor:
+    def __init__(self, api_keys: List[str], config: ConfigManager):
+        self.clients = [Cerebras(api_key=key) for key in api_keys if key]
+        self.config = config
 
-processed_posts = set()
-
-
-def is_giveaway_post(text: str) -> bool:
-    if not text:
-        return False
-
-    text_upper = text.upper()
-
-    if "🎁 РОЗЫГРЫШ" not in text_upper:
-        return False
-
-    keywords = ["АНАГРАММА", "ЗАГАДКА", "КВИЗ", "ПРИМЕР", "ЭМОДЗИ"]
-
-    return any(word in text_upper for word in keywords)
-
-
-async def get_ai_answer(text: str):
-    headers = {
-        "Authorization": f"Bearer {HH_ADMIN_KEY}",
-        "Content-Type": "application/json"
-    }
-
-    payload = {
-        "model": "google/gemini-2.5-flash",
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "Это розыгрыш. "
-                    "Если анаграмма — собери слово. "
-                    "Если загадка — дай ответ. "
-                    "Если квиз — дай правильный ответ. "
-                    "Если пример — реши его. "
-                    "Если эмодзи — отправь только нужный эмодзи. "
-                    "Отправь только ответ без пояснений."
+    async def chat(self, messages: List[Dict]) -> Optional[str]:
+        random.shuffle(self.clients)
+        current_model = self.config.get("model")
+        for client in self.clients:
+            try:
+                full_msgs = [{"role": "system", "content": self.config.get("prompt")}] + messages
+                response = await asyncio.to_thread(
+                    client.chat.completions.create,
+                    model=current_model,
+                    messages=full_msgs
                 )
-            },
-            {"role": "user", "content": text}
-        ],
-        "temperature": 0
-    }
-
-    loop = asyncio.get_event_loop()
-
-    try:
-        response = await loop.run_in_executor(
-            None,
-            lambda: requests.post(
-                HH_API_URL,
-                json=payload,
-                headers=headers,
-                timeout=60
-            )
-        )
-
-        if response.status_code == 200:
-            data = response.json()
-            answer = data["choices"][0]["message"]["content"].strip()
-            answer = re.split(r"\n", answer)[0]
-            return answer
-
-    except Exception as e:
-        print("❌ Ошибка запроса к API:", e)
-
-    return None
-
-import re
-from telethon import events
-
-WATCH_BOT = "giftchannelsbot"
-WIN_TEXT = "ПОЗДРАВЛЯЕМ"
-NOTIFY_USER = "truvun"
-
-
-@client.on(events.NewMessage(from_users=WATCH_BOT))
-async def win_notifier(event):
-    text = event.raw_text
-
-    if not text:
-        return
-
-    if WIN_TEXT in text:
-        print("🏆 Победа обнаружена!")
-
-        # ищем ссылку на чек
-        match = re.search(r"https://t\.me/CryptoBot\?start=\S+", text)
-
-        notify_message = "🏆 ВЫ ВЫИГРАЛИ!\n\n"
-
-        if match:
-            link = match.group(0)
-            notify_message += f"💰 Чек:\n{link}"
-
-        await client.send_message(NOTIFY_USER, notify_message)
-
-        print("📩 Уведомление отправлено @truvun")
-
-import asyncio
-
-BOT_USERNAME = "giftchannelsbot"
-WIN_TEXT = "ПОЗДРАВЛЯЕМ"
-
-async def solve_giveaway(task_text):
-
-    tried_answers = set()
-
-    while True:
-        print("🤖 Генерирую ответ...")
-
-        answer = await get_ai_answer(task_text)
-
-        if not answer:
-            print("⚠ AI не дал ответ")
-            await asyncio.sleep(3)
-            continue
-
-        answer = answer.strip()
-
-        # чтобы не отправлять один и тот же ответ
-        if answer in tried_answers:
-            print("♻ Уже пробовали:", answer)
-            await asyncio.sleep(2)
-            continue
-
-        tried_answers.add(answer)
-
-        await client.send_message(BOT_USERNAME, answer)
-        print("📤 Отправлено:", answer)
-
-        # ждём 6 секунд
-        await asyncio.sleep(6)
-
-        messages = await client.get_messages(BOT_USERNAME, limit=5)
-
-        win_detected = False
-        someone_won = False
-        wrong_answer = False
-
-        for msg in messages:
-            if not msg.text:
+                return response.choices[0].message.content
+            except Exception as e:
+                logging.error(f"AI Error: {e}")
                 continue
+        return None
 
-            text = msg.text
-
-            if WIN_TEXT in text:
-                win_detected = True
-
-            if "победил" in text.lower():
-                someone_won = True
-
-            if "неверн" in text.lower():
-                wrong_answer = True
-
-        if win_detected:
-            print("🏆 МЫ ПОБЕДИЛИ!")
-            break
-
-        if someone_won:
-            print("❌ Кто-то уже выиграл")
-            break
-
-        if wrong_answer:
-            print("❌ Ответ неверный, пробуем другой")
-            continue
-
-        print("🔁 Нет победы, пробуем новый ответ...")
-
-
-@client.on(events.NewMessage(chats=CHANNEL_USERNAME))
-async def handler(event):
-
-    if not event.message.post:
-        return
-
-    post_id = event.message.id
-
-    if post_id in processed_posts:
-        return
-
-    text = event.message.text
-    if not text:
-        return
-
-    if not is_giveaway_post(text):
-        print("⛔ Не розыгрыш — пропуск")
-        return
-
-    processed_posts.add(post_id)
-
-    print("🎁 Найден розыгрыш! Решаю...")
-
-    answer = await get_ai_answer(text)
-
-    if not answer:
-        print("❌ Ответ не получен")
-        return
-
-    try:
-        await asyncio.sleep(0.1)
-
-        channel = await client.get_entity(CHANNEL_USERNAME)
-
-        result = await client(
-            functions.messages.GetDiscussionMessageRequest(
-                peer=channel,
-                msg_id=post_id
-            )
+class InstaDownloader:
+    def __init__(self):
+        self.L = instaloader.Instaloader(
+            download_pictures=False,
+            download_videos=True,
+            download_video_thumbnails=False,
+            download_geotags=False,
+            download_comments=False,
+            save_metadata=False
         )
 
-        if not result.messages:
-            print("❌ Обсуждение не найдено")
-            return
+    async def download_video(self, url: str) -> Optional[str]:
+        try:
+            shortcode = url.split("/")[-2] if url.endswith("/") else url.split("/")[-1]
+            if "?" in shortcode: shortcode = shortcode.split("?")[0]
+            target_dir = f"temp_{shortcode}_{int(time.time())}"
+            def sync_download():
+                post = instaloader.Post.from_shortcode(self.L.context, shortcode)
+                self.L.download_post(post, target=target_dir)
+                for file in os.listdir(target_dir):
+                    if file.endswith(".mp4"):
+                        return os.path.join(target_dir, file)
+                return None
+            return await asyncio.to_thread(sync_download)
+        except Exception as e:
+            logging.error(f"Instaloader Error: {e}")
+            return None
 
-        discussion_msg = result.messages[0]
+class AdminStates(StatesGroup):
+    waiting_auth = State()
+    menu = State()
+    editing_prompt = State()
+    editing_model = State()
+    adding_note_key = State()
+    adding_note_val = State()
 
-        await client.send_message(
-            discussion_msg.peer_id,
-            answer,
-            reply_to=discussion_msg.id
-        )
+router = Router()
+AI_TRIGGER = r"(?i)^(джарвис|jarvis|/ai|sai|s2)\b"
+INSTA_RE = r"(https?://(?:www\.)?instagram\.com/(?:p|reels|reel)/([^/?#&]+))"
+insta = InstaDownloader()
 
-        print(f"🏆 Ответ отправлен под постом: {answer}")
+@router.message(Command("start"))
+async def start_handler(msg: Message):
+    await msg.answer("🤖 Джарвис на связи.")
 
-    except FloodWaitError as e:
-        print(f"⏳ FloodWait {e.seconds} сек")
-        await asyncio.sleep(e.seconds)
+@router.message(F.text.startswith("#"))
+async def notes_handler(msg: Message, config: ConfigManager):
+    notes = config.get("notes")
+    cmd = msg.text.split()[0].lower()
+    if cmd in notes:
+        await msg.reply(notes[cmd])
 
-    except Exception as e:
-        print(f"❌ Ошибка отправки: {e}")
+@router.message(F.text.regexp(INSTA_RE))
+async def instagram_handler(msg: Message):
+    await msg.bot.send_chat_action(msg.chat.id, ChatAction.UPLOAD_VIDEO)
+    match = re.search(INSTA_RE, msg.text)
+    url = match.group(1)
+    wait_msg = await msg.reply("⏳ Загружаю...")
+    file_path = await insta.download_video(url)
+    if file_path and os.path.exists(file_path):
+        try:
+            await msg.reply_video(FSInputFile(file_path), caption="🎬 Готово")
+            await wait_msg.delete()
+        except Exception:
+            await wait_msg.edit_text("❌ Ошибка отправки")
+        finally:
+            shutil.rmtree(os.path.dirname(file_path), ignore_errors=True)
+    else:
+        await wait_msg.edit_text("❌ Не удалось скачать")
 
-# =========================
-# ЗАПУСК БОТА
-# =========================
+@router.business_message(F.text.regexp(AI_TRIGGER))
+@router.message(F.text.regexp(AI_TRIGGER))
+async def ai_handler(msg: Message, ai: AIProcessor, history: HistoryManager, config: ConfigManager):
+    user_key = f"{msg.chat.id}_{msg.from_user.id}"
+    query = re.sub(AI_TRIGGER, "", msg.text, flags=re.IGNORECASE).strip()
+    if not query: return
+    if not msg.business_connection_id:
+        await msg.bot.send_chat_action(msg.chat.id, ChatAction.TYPING)
+    history.add_msg(user_key, "user", query, config.get("context_size"))
+    response = await ai.chat(history.get_history(user_key))
+    if response:
+        history.add_msg(user_key, "assistant", response, config.get("context_size"))
+        if msg.business_connection_id:
+            await msg.bot.edit_message_text(business_connection_id=msg.business_connection_id, chat_id=msg.chat.id, message_id=msg.message_id, text=response)
+        else:
+            await msg.reply(response)
+
+@router.message(Command("S2HFHF"))
+async def admin_start(msg: Message, state: FSMContext):
+    await msg.answer("🔑 Пароль:")
+    await state.set_state(AdminStates.waiting_auth)
+
+@router.message(AdminStates.waiting_auth)
+async def admin_auth(msg: Message, state: FSMContext, config: ConfigManager):
+    if msg.text == os.getenv("ADMIN_PASSWORD", "import"):
+        await state.set_state(AdminStates.menu)
+        await show_admin_menu(msg, config)
+    else:
+        await state.clear()
+
+async def show_admin_menu(msg: Message, config: ConfigManager):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"🤖 Модель: {config.get('model')}", callback_data="set_model")],
+        [InlineKeyboardButton(text="📝 Промт", callback_data="set_prompt")],
+        [InlineKeyboardButton(text="📌 Управление Заметками", callback_data="manage_notes")],
+        [InlineKeyboardButton(text="❌ Выход", callback_data="exit")]
+    ])
+    await msg.answer("⚙️ Панель управления:", reply_markup=kb)
+
+@router.callback_query(F.data == "manage_notes", AdminStates.menu)
+async def manage_notes(call: CallbackQuery, config: ConfigManager):
+    notes = config.get("notes")
+    text = "📌 <b>Твои заметки:</b>\n\n"
+    buttons = []
+    for k in notes.keys():
+        buttons.append([
+            InlineKeyboardButton(text=f"❌ {k}", callback_data=f"del_note_{k}")
+        ])
+    buttons.append([InlineKeyboardButton(text="➕ Добавить заметку", callback_data="add_note")])
+    buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_menu")])
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+    await call.message.edit_text(text + "Нажми на заметку, чтобы удалить её.", reply_markup=kb)
+
+@router.callback_query(F.data.startswith("del_note_"))
+async def delete_note(call: CallbackQuery, config: ConfigManager):
+    note_key = call.data.replace("del_note_", "")
+    notes = config.get("notes")
+    if note_key in notes:
+        del notes[note_key]
+        config.set("notes", notes)
+        await call.answer(f"Заметка {note_key} удалена")
+        await manage_notes(call, config)
+
+@router.callback_query(F.data == "add_note")
+async def add_note_step1(call: CallbackQuery, state: FSMContext):
+    await call.message.edit_text("Введи ключ заметки (например, #news):")
+    await state.set_state(AdminStates.adding_note_key)
+
+@router.message(AdminStates.adding_note_key)
+async def add_note_step2(msg: Message, state: FSMContext):
+    if not msg.text.startswith("#"):
+        return await msg.answer("Ошибка: заметка должна начинаться с символа #")
+    await state.update_data(new_note_key=msg.text.lower())
+    await msg.answer("Введи текст или ссылку для этой заметки:")
+    await state.set_state(AdminStates.adding_note_val)
+
+@router.message(AdminStates.adding_note_val)
+async def add_note_final(msg: Message, state: FSMContext, config: ConfigManager):
+    data = await state.get_data()
+    notes = config.get("notes")
+    notes[data['new_note_key']] = msg.text
+    config.set("notes", notes)
+    await msg.answer(f"✅ Заметка {data['new_note_key']} успешно создана!")
+    await state.set_state(AdminStates.menu)
+    await show_admin_menu(msg, config)
+
+@router.callback_query(F.data == "back_to_menu")
+async def back_menu(call: CallbackQuery, state: FSMContext, config: ConfigManager):
+    await state.set_state(AdminStates.menu)
+    await call.message.delete()
+    await show_admin_menu(call.message, config)
+
+@router.callback_query(F.data == "exit")
+async def exit_adm(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await call.message.delete()
 
 async def main():
-    print("🚀 Бот запущен и ждёт розыгрыши...")
-    await client.start()
-    print("✅ Авторизация успешна")
-    await client.run_until_disconnected()
-
+    load_dotenv()
+    # Твой новый токен
+    token = "8506339952:AAFcCDcPzrx1GTksDOH14cPtza0pKW11g20"
+    
+    bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    dp = Dispatcher(storage=MemoryStorage())
+    cfg = ConfigManager()
+    hist = HistoryManager()
+    
+    keys = [
+        os.getenv("CEREBRAS_API_KEY"), 
+        "csk-mymvy3hvw89x95m4y8v8kxk2kvehd2m2jemvnewe6dypncfx", 
+        "csk-th8wnt28nc9tfcck6mjjmfkn4wf2f9j43v4mfe4rd3cmrcv8", 
+        "csk-yk8mfekexj5n96ej8m65y32ympcfw556n5y4rhf8xyywy5m2", 
+        "csk-de9cetwd8p6x65rftx395kmjrc9j5fwj6848tck5md9rftth"
+    ]
+    
+    ai = AIProcessor(api_keys=keys, config=cfg)
+    dp.include_router(router)
+    
+    await bot.delete_webhook(drop_pending_updates=True)
+    await dp.start_polling(bot, config=cfg, history=hist, ai=ai)
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("⛔ Бот остановлен вручную")
+    asyncio.run(main())
